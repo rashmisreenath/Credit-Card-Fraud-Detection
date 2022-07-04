@@ -1,9 +1,25 @@
+Domain - Banking Technologies
+Language - R
+IDE - R script
+Dataset link :- https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
+
+
+Business Impact
+
 In 2019, credit card fraud losses amounted to $28.65 billion worldwide. 
 We developed an ML model, which works on XGBOOST to reduce the loss faced by these credit card companies.  
 About 90% reduction in the cost could be achieved using this technique.
 
 
-Domain - Banking Technologies
-Language - R
-IDE - R script
-Dataset link :- https://www.kaggle.com/datasets/mlg-ulb/creditcardfraud
+Dataset Overview
+
+The dataset contains European cardholder transactions that occurred over two days.
+* Time - the seconds elapsed between each transaction and the first transaction in the dataset
+* V1, V2, ..., V28 - principal components obtained through dimensionality reduction (PCA)
+* Amount - the transaction amount
+* Class - the response variable, indicating whether a transaction was fraudulent or not
+
+
+
+
+
