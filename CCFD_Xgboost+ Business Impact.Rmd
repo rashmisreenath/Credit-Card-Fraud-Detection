@@ -1,0 +1,614 @@
+---
+title: "Credit Card Fraud Detection - SMOTE, XGBoost & Business Impact"
+---
+
+
+# Import Libraries and loading data
+
+
+```{r message = F, warning = F}
+library(tidyverse) # everything
+library(reshape2) # melting tables
+library(caret) # training, cross-validation, hyperparameter search
+library(xgboost) # XGBoost
+library(Matrix) # XGBoost sparse matrices
+library(tictoc) # timing models
+library(PRROC) # AUROC and AUPRC
+library(smotefamily) # synthetic minority over-sampling
+library(ROSE) # random majority under-sampling
+library(gridExtra) # combining graphs
+library(MLmetrics )
+theme_set(theme_light()) # cleaner graphs
+
+data <- data.table::fread("D:/1. Big Data Analytics (Sem 2)/5. Credit Card Fraud Detection/CCFD.csv")
+data$Class <- factor(ifelse(data$Class == 0, "zero", "one")) # creates issues later in caret if using 0, 1
+```
+As found before, our data was highly imbalanced i.e., out of 284,807 transactions, just 492 were fraudulent
+
+## Feature Engineering
+
+```{r}
+data$hour_of_day <- (data$Time/3600) %% 24 # convert to hours, then reduce mod 24
+
+ggplot(data, aes(x = hour_of_day, fill = Class)) +
+  geom_density(alpha = 0.4) + 
+  scale_x_continuous(limits = c(0, 24), breaks = seq(0, 24, 2)) + 
+  labs(title = "Engineered Feature - Hour of Day", 
+       x = "Hour of Day", 
+       y = "Density", 
+       col = "Class") + 
+  scale_fill_discrete(labels = c("Fraud", "Not Fraud"))
+  
+data$Time <- NULL
+```
+
+
+### Amount Paid
+
+```{r warning = F}
+ggplot(data, aes(x = Amount, fill = Class)) +
+  geom_density(alpha = 0.4) +
+  scale_x_continuous(limits = c(0, 500), breaks = seq(0, 500, 100)) + 
+  labs(title = "Transaction Amount", 
+       x = "Amount", 
+       y = "Density", 
+       col = "Class") + 
+  scale_fill_discrete(labels = c("Fraud", "Not Fraud"))
+```
+
+### PCA variables
+
+
+```{r}
+pca_corr <- round(cor(data[ ,1:28]), 3)
+
+max(abs(pca_corr)[upper.tri(pca_corr)])
+```
+
+The max pearson correlation coefficient is 0, as we would expect no corr for PCA data.
+
+
+## SMOTE Pre-Processing
+
+```{r}
+predictors <- select(data, -Class)
+
+cbind(melt(apply(predictors, 2, min), value.name = "min"), 
+      melt(apply(predictors, 2, max), value.name = "max"))
+```
+# Rescaling the data btw 0 to 1
+
+```{r}
+rescale <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+predictors_rescaled <- as.data.frame(apply(predictors, 2, rescale))
+
+cbind(melt(apply(predictors_rescaled, 2, min), value.name = "min_after_rescaling"), 
+      melt(apply(predictors_rescaled, 2, max), value.name = "max_after_rescaling"))
+```
+
+
+```{r}
+data <- cbind(Class = data$Class, predictors_rescaled)
+
+# levels(data$Class)
+```
+
+```{r}
+set.seed(23)
+sample <- sample_n(data, 10000)
+
+
+# 1) generating 4 synthetic minority samples for every 1 legitimate
+sample_smote <- SMOTE(X = sample[, -1], 
+                      target = sample$Class, 
+                      dup_size = 4)
+
+sample_smote_data <- sample_smote$data
+sample_smote_data$class <- factor(sample_smote_data$class)
+# levels(sample_smote_data$class)
+```
+```{r}
+table(sample_smote_data$class)
+```
+
+
+
+```{r}
+# 2) now randomly undersampling majority
+sample_smote_under <- ovun.sample(class ~ .,
+                                  data = sample_smote_data,
+                                  method = "under",
+                                  N = nrow(sample_smote_data[sample_smote_data$class == "one", ]) * 11)
+
+sample_smote_under_data <- sample_smote_under$data
+# levels(sample_smote_under_data$class)
+sample_smote_under_data$class <- relevel(sample_smote_under_data$class, ref = "one")
+```
+
+
+```{r fig.height=10}
+p1 <- ggplot(sample, aes(x = V1, y = V2, col = Class)) + 
+  geom_point(alpha = 0.3) + 
+  facet_wrap(~ Class, labeller = labeller(Class = c(one = "Fraud", zero = "Not Fraud"))) + 
+  labs(title = "Before SMOTE", 
+       subtitle = "10,000 Random Sample", 
+       col = "Class") + 
+  scale_x_continuous(limits = c(0, 1)) + 
+  scale_y_continuous(limits = c(0, 1)) + 
+  theme(legend.position = "none")
+
+p2 <- ggplot(sample_smote_data, aes(x = V1, y = V2, col = class)) + 
+  geom_point(alpha = 0.3) + 
+  facet_wrap(~ class, labeller = labeller(class = c(one = "Fraud", zero = "Not Fraud"))) + 
+  labs(title = "After SMOTE", 
+       subtitle = "4 Synthetic Majority Samples (per original minority sample)", 
+       col = "Class") + 
+  scale_x_continuous(limits = c(0, 1)) + 
+  scale_y_continuous(limits = c(0, 1)) + 
+  theme(legend.position = "none")
+
+p3 <- ggplot(sample_smote_under_data, aes(x = V1, y = V2, col = class)) + 
+  geom_point(alpha = 0.3) + 
+  facet_wrap(~ class, labeller = labeller(class = c(one = "Fraud", zero = "Not Fraud"))) + 
+  labs(title = "After SMOTE & Random Majority Undersampling", 
+       subtitle = "Reduced majority:minority ratio to 10:1", 
+       col = "Class") + 
+  scale_x_continuous(limits = c(0, 1)) + 
+  scale_y_continuous(limits = c(0, 1)) + 
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, p3, nrow = 3)
+```
+Now, the data is balanced
+
+## Train/Test Split
+
+# Six different datasets are formed
+```{r}
+set.seed(23)
+
+train_index <- createDataPartition(data$Class, p=0.75, list=FALSE)
+
+train <- data[train_index, ] # training data (75% of data)
+test <- data[-train_index, ] # testing data (25% of data)
+```
+
+
+**2. A balanced dataset with *less* up-sampling, `train_v1`**
+
+```{r}
+set.seed(23)
+smote_v1 <- SMOTE(X = train[, -1], target = train$Class, dup_size = 4) # generating 4 synthetic minority samples for every 1 legitimate
+smote_train_v1 <- smote_v1$data %>% rename(Class = class)
+
+# under-sample until majority sample size matches
+under_v1 <- ovun.sample(Class ~ .,
+                        data = smote_train_v1,
+                        method = "under",
+                        N = 2 * sum(smote_train_v1$Class == "one"))
+
+train_v1 <- under_v1$data
+```
+
+
+**3. A balanced dataset with *more* up-sampling, `train_v2`**
+
+```{r}
+set.seed(23)
+smote_v2 <- SMOTE(X = train[, -1], target = train$Class, dup_size = 29)
+smote_train_v2 <- smote_v2$data %>% rename(Class = class)
+
+under_v2 <- ovun.sample(Class ~ .,
+                        data = smote_train_v2,
+                        method = "under",
+                        N = 2 * sum(smote_train_v2$Class == "one"))
+
+train_v2 <- under_v2$data
+```
+
+
+**4. A fraud-majority dataset with *less* up-sampling, `train_v3`**
+
+```{r}
+set.seed(23)
+smote_v3 <- SMOTE(X = train[, -1], target = train$Class, dup_size = 4)
+smote_train_v3 <- smote_v3$data %>% rename(Class = class)
+
+under_v3 <- ovun.sample(Class ~ .,
+                        data = smote_train_v3,
+                        method = "under",
+                        N = round(sum(smote_train_v3$Class == "one") * (4/3)))
+
+train_v3 <- under_v3$data
+```
+
+**5. A fraud-majority dataset with *more* up-sampling, `train_v4`**
+
+```{r}
+set.seed(23)
+smote_v4 <- SMOTE(X = train[, -1], target = train$Class, dup_size = 29)
+smote_train_v4 <- smote_v4$data %>% rename(Class = class)
+
+under_v4 <- ovun.sample(Class ~ .,
+                        data = smote_train_v4,
+                        method = "under",
+                        N = round(sum(smote_train_v4$Class == "one") * (4/3)))
+
+train_v4 <- under_v4$data
+```
+
+**6. A fraud-minority dataset with *less* up-sampling, `train_v5`**
+
+```{r}
+set.seed(23)
+smote_v5 <- SMOTE(X = train[, -1], target = train$Class, dup_size = 4)
+smote_train_v5 <- smote_v5$data %>% rename(Class = class)
+
+under_v5 <- ovun.sample(Class ~ .,
+                        data = smote_train_v5,
+                        method = "under",
+                        N = (sum(smote_train_v5$Class == "one") * 4))
+
+train_v5 <- under_v5$data
+```
+
+**7. A fraud-minority dataset with *more* up-sampling, `train_v6`**
+
+```{r}
+set.seed(23)
+smote_v6 <- SMOTE(X = train[, -1], target = train$Class, dup_size = 29)
+smote_train_v6 <- smote_v6$data %>% rename(Class = class)
+
+under_v6 <- ovun.sample(Class ~ .,
+                        data = smote_train_v6,
+                        method = "under",
+                        N = (sum(smote_train_v6$Class == "one") * 4))
+
+train_v6 <- under_v6$data
+```
+
+
+```{r}
+# checking:
+# class(train$Class)
+# class(train_v1$Class)
+# class(train_v2$Class)
+# class(train_v3$Class)
+# class(train_v4$Class)
+# class(train_v5$Class)
+# class(train_v6$Class)
+# class(test$Class)
+
+train$Class <- factor(train$Class)
+train_v1$Class <- factor(train_v1$Class)
+train_v2$Class <- factor(train_v2$Class)
+train_v3$Class <- factor(train_v3$Class)
+train_v4$Class <- factor(train_v4$Class)
+train_v5$Class <- factor(train_v5$Class)
+train_v6$Class <- factor(train_v6$Class)
+
+# levels(train$Class)
+# levels(train_v1$Class)
+# levels(train_v2$Class)
+# levels(train_v3$Class)
+# levels(train_v4$Class)
+# levels(train_v5$Class)
+# levels(train_v6$Class)
+# levels(test$Class)
+```
+
+
+
+```{r}
+train_datasets <- list(train = train,
+                       train_v1 = train_v1,
+                       train_v2 = train_v2,
+                       train_v3 = train_v3,
+                       train_v4 = train_v4, 
+                       train_v5 = train_v5, 
+                       train_v6 = train_v6)
+
+dataset <- 0
+obs <- 0
+frauds <- 0
+frauds_perc <- 0
+
+for (i in 1:7) {
+  dataset[i] <- names(train_datasets)[i]
+  obs[i] <- nrow(train_datasets[[i]])
+  frauds[i] <- sum(train_datasets[[i]]$Class == "one")
+  frauds_perc[i] <- frauds[i] / obs[i]
+}
+
+(train_datasets_summary <- data.frame(name = dataset, 
+                                     num_obs = obs, 
+                                     frauds = frauds, 
+                                     frauds_perc = frauds_perc, 
+                                     weighting = c("original (very imbalanced)", "balanced", "balanced", "mostly fraud", "mostly fraud", "mostly non-fraud", "mostly non-fraud"), 
+                                     smote_amt = c("none", "some", "lots", "some", "lots", "some", "lots")))
+```
+Summary of 6 datasets used
+
+
+```{r}
+xgb_train <- sparse.model.matrix(Class ~ . -1, data = train)
+xgb_train_v1 <- sparse.model.matrix(Class ~ . -1, data = train_v1)
+xgb_train_v2 <- sparse.model.matrix(Class ~ . -1, data = train_v2)
+xgb_train_v3 <- sparse.model.matrix(Class ~ . -1, data = train_v3)
+xgb_train_v4 <- sparse.model.matrix(Class ~ . -1, data = train_v4)
+xgb_train_v5 <- sparse.model.matrix(Class ~ . -1, data = train_v5)
+xgb_train_v6 <- sparse.model.matrix(Class ~ . -1, data = train_v6)
+xgb_test <- sparse.model.matrix(Class ~ . -1, data = test)
+
+ctrl_xgb <- trainControl(method = "cv",
+                         number = 3, # 3-fold cross-validation
+                         summaryFunction=prSummary, # area under precision-recall curve
+                         classProbs=TRUE,
+                         allowParallel = TRUE)
+```
+
+
+
+## XGBoost Training
+
+Training 7 models using the different train datasets were analysed, but the unaltered dataset was found to be most effective of all.So proceeding with the unaltered dataset 
+
+
+## Model Summary
+
+precision-recall curves was found to be better in comparission to ROC for this particular dataset
+
+The balanced datasets and those that maintained the fraud minority seemed to perform better than those where the class imbalance was reversed (to a fraud majority):
+
+## Deeper Model Tuning
+
+### Round 1 (learning rate, number of trees)
+
+```{r eval = F}
+ctrl_xgb <- trainControl(method = "cv",
+                         number = 3,
+                         summaryFunction = prSummary,
+                         classProbs = TRUE,
+                         verboseIter = TRUE)
+
+xgb_final_grid1 <- expand.grid(nrounds = seq(100, 1000, 100), # don't want to go much higher, training times (prev: 150)
+                               max_depth = 3,
+                               eta = 0.3,
+                               colsample_bytree = 0.8,
+                               subsample = 1,
+                               gamma = 0,
+                               min_child_weight = 1)
+
+tic()
+set.seed(23)
+xgb_final_1 <- train(x = xgb_train,
+                     y = train$Class,
+                     method = "xgbTree",
+                     metric = "AUC",
+                     trControl = ctrl_xgb,
+                     tuneGrid = xgb_final_grid1)
+toc()
+
+xgb_final_1$bestTune # now fixing nrounds at 500, eta = 0.3
+
+max(xgb_final_1$results$AUC)
+```
+
+**Chosen Parameters**
+
+* `eta` fixed at 0.3
+* `nrounds` fixed at 500
+
+
+### Round 2 (max depth, minimum child weight)
+
+```{r eval = F}
+# notes: first tried max_depth = c(3, 5, 7, 9), min_child_weight = c(1, 2), chose: max depth = 5, min_child_weight = 1
+# max_depth = 5 chosen on next search too
+
+xgb_final_grid2 <- expand.grid(nrounds = 500, # FIXED
+                               max_depth = c(4, 5, 6),
+                               eta = 0.3, # FIXED
+                               colsample_bytree = 0.8,
+                               subsample = 1,
+                               gamma = 0,
+                               min_child_weight = 1)
+
+tic()
+set.seed(23)
+xgb_final_2 <- train(x = xgb_train,
+                     y = train$Class,
+                     method = "xgbTree",
+                     metric = "AUC",
+                     trControl = ctrl_xgb,
+                     tuneGrid = xgb_final_grid2)
+toc()
+
+xgb_final_2$bestTune # nrounds = 500, eta = 0.3, max_depth = 5, min_child_weight = 1
+
+max(xgb_final_2$results$AUC)
+```
+
+**Chosen Parameters**
+
+* `eta` = 0.3
+* `nrounds` = 500
+* `max_depth` = 5
+* `min_child_weight` = 1
+
+
+### Round 3 (gamma)
+
+```{r eval = F}
+xgb_final_grid3 <- expand.grid(nrounds = 500, # FIXED
+                               max_depth = 5, # FIXED
+                               eta = 0.3, # FIXED
+                               colsample_bytree = 0.8,
+                               subsample = 1,
+                               gamma = c(0, 0.1, 0.2, 0.3, 0.4),
+                               min_child_weight = 1) # FIXED
+
+tic()
+set.seed(23)
+xgb_final_3 <- train(x = xgb_train,
+                     y = train$Class,
+                     method = "xgbTree",
+                     metric = "AUC",
+                     trControl = ctrl_xgb,
+                     tuneGrid = xgb_final_grid3)
+toc()
+
+xgb_final_3$bestTune # nrounds = 500, eta = 0.3, max_depth = 5, min_child_weight = 1, gamma = 0
+
+max(xgb_final_3$results$AUC)
+
+```
+
+**Chosen Parameters**
+
+* `eta` = 0.3
+* `nrounds` = 500
+* `max_depth` = 5
+* `min_child_weight` = 1
+* `gamma` = 0
+
+
+### Round 4 (column and row subsampling)
+
+```{r eval = F}
+
+xgb_final_grid4 <- expand.grid(nrounds = 500, # FIXED
+                               max_depth = 5, # FIXED
+                               eta = 0.3, # FIXED
+                               colsample_bytree = c(0.7, 0.8, 0.9),
+                               subsample = c(0.5, 0.6, 0.7),
+                               gamma = 0, # FIXED
+                               min_child_weight = 1) # FIXED
+
+tic()
+set.seed(23)
+xgb_final_4 <- train(x = xgb_train,
+                     y = train$Class,
+                     method = "xgbTree",
+                     metric = "AUC",
+                     trControl = ctrl_xgb,
+                     tuneGrid = xgb_final_grid4)
+toc()
+
+xgb_final_4$bestTune 
+
+max(xgb_final_4$results$AUC)
+```
+
+**Chosen Parameters**
+
+* `eta` = 0.3 (will now reduce)
+* `nrounds` = 500 (will now increase)
+* `max_depth` = 5
+* `min_child_weight` = 1
+* `gamma` = 0
+* `colsample_bytree` = 0.8
+* `subsample` = 0.6
+
+
+### Round 5 (decrease learning rate, increase trees)
+
+```{r eval = F}
+xgb_final_grid5 <- expand.grid(nrounds = seq(500, 2000, 100), # TUNING
+                               max_depth = 5, # FIXED
+                               eta = 0.05, # REDUCING
+                               colsample_bytree = 0.8, # FIXED
+                               subsample = 0.6, # FIXED
+                               gamma = 0, # FIXED
+                               min_child_weight = 1) # FIXED
+
+tic()
+set.seed(23)
+xgb_final_5 <- train(x = xgb_train,
+                     y = train$Class,
+                     method = "xgbTree",
+                     metric = "AUC",
+                     trControl = ctrl_xgb,
+                     tuneGrid = xgb_final_grid5)
+toc()
+
+xgb_final_5$bestTune
+
+plot(xgb_final_5)
+```
+
+**Chosen Parameters**
+
+* `eta` = 0.05
+* `nrounds` = 1400
+* `max_depth` = 5
+* `min_child_weight` = 1
+* `gamma` = 0
+* `colsample_bytree` = 0.8
+* `subsample` = 0.6
+
+
+
+## Fitting the Final Model
+
+As seen above, the **final parameters** chosen are:
+
+* `eta` = 0.05
+* `nrounds` = 1400
+* `max_depth` = 5
+* `min_child_weight` = 1
+* `gamma` = 0
+* `colsample_bytree` = 0.8
+* `subsample` = 0.6
+
+```{r warning = F}
+xgb_final_grid5 <- expand.grid(nrounds = 1400,
+                               max_depth = 5,
+                               eta = 0.05,
+                               colsample_bytree = 0.8,
+                               subsample = 0.6,
+                               gamma = 0,
+                               min_child_weight = 1)
+
+
+tic()
+set.seed(23)
+xgb_final_5 <- train(x = xgb_train,
+                     y = train$Class,
+                     method = "xgbTree",
+                     metric = "AUC",
+                     trControl = trainControl(method = "none"), 
+                     tuneGrid = xgb_final_grid5)
+toc()
+
+xgb_final_5_pred <- predict(xgb_final_5, xgb_test, type = "prob")
+
+xgb_final_5_scores <- data.frame(event_prob = xgb_final_5_pred$one, labels = test$Class)
+
+xgb_final_5_roc <- PRROC::roc.curve(scores.class0 = xgb_final_5_scores[xgb_final_5_scores$labels == "one", ]$event_prob, 
+                                     scores.class1 = xgb_final_5_scores[xgb_final_5_scores$labels == "zero", ]$event_prob, 
+                                     curve=T)
+
+xgb_final_5_auprc <- PRROC::pr.curve(scores.class0 = xgb_final_5_scores[xgb_final_5_scores$labels == "one", ]$event_prob, 
+                                      scores.class1 = xgb_final_5_scores[xgb_final_5_scores$labels == "zero", ]$event_prob, 
+                                      curve=T)
+```
+
+
+## Performance Evaluation
+
+
+
+Final fine-tuned model
+
+```{r}
+paste("Area under the Precision-Recall curve:", round(xgb_final_5_auprc$auc.integral, 7))
+paste("Area under the ROC curve:", round(xgb_final_5_roc$auc, 7))
+```
+Cut-off Experimentation was performed to further optimize the values
+
+
+
